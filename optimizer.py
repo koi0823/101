@@ -368,7 +368,12 @@ def solve_packing(container_l, container_w, container_h, items_data,
     # 0. AUTO-DETECT CONTAINER SIZE
     is_40ft = container_l > 9000
     
-    # 1. Scan and Build All Items List
+    # NOTE: We do NOT force allow_stacking to False here for Item creation.
+    # We want Items to be CAPABLE of stacking (if valid), but we control the 
+    # CONTAINER'S stacking permission in the simulation phases below.
+    # This allows the fallback (Phase 2) to work for 40ft containers.
+
+    # 1. Scan and Build All Items List (Combine all Lists 1, 2, 3, 4 etc.)
     base_items_raw = []
     for d in items_data:
         for _ in range(int(d['qty'])):
@@ -383,27 +388,51 @@ def solve_packing(container_l, container_w, container_h, items_data,
                      priority=priority, 
                      type_id=d.get('type_id', None),
                      max_load_on_top=max_load,
-                     allow_stacking=allow_stacking,
+                     allow_stacking=allow_stacking, # Uses the argument (default True)
                      packaging_type=packaging_type)
             )
             
+    # Calculate Total Weight for Global Split Logic
     total_batch_weight = sum(item.weight for item in base_items_raw)
     
-    # 2. DECIDE STRATEGY BASED ON CONTAINER LENGTH
-    part_a, part_b, part_c = [], [], []
+    # 2. DECIDE STRATEGY BASED ON CONTAINER LENGTH (Re-using is_40ft)
     
+    part_a = [] # Back
+    part_b = [] # Middle (for 40ft) or Front (for 20ft)
+    part_c = [] # Front (for 40ft only)
+    
+    # --- STRATEGY: 40ft (CENTRAL/MIDDLE BIAS for BALANCE) ---
     if is_40ft:
+        # User request: "balance and long one u can put in the middle"
+        # Strategy: 20% Back | 60% Middle (Heavy/Long) | 20% Front
+        
         target_a = 0.20 * total_batch_weight 
-        must_go_a, can_go_b, others = [], [], []
+        target_c = 0.20 * total_batch_weight
+        
+        # 1. Identify "Container Spanning" items vs "Mid-Long" items vs Others
+        # Items > 9000mm MUST go in A (Back) to guarantee fit.
+        # Items 3000mm - 9000mm can go in B (Middle) to balance CoG.
+        
+        must_go_a = []
+        can_go_b = [] # Long items for middle
+        others = []
         
         for item in base_items_raw:
             max_d = max(item.l, item.w)
-            if max_d > 9000: must_go_a.append(item)
-            elif max_d >= 3000: can_go_b.append(item)
-            else: others.append(item)
+            if max_d > 9000:
+                must_go_a.append(item)
+            elif max_d >= 3000:
+                can_go_b.append(item)
+            else:
+                others.append(item)
         
+        # 2. Fill Part A (Back)
+        # Start with MUST items (Super Long)
         part_a.extend(must_go_a)
         current_a_weight = sum(i.weight for i in part_a)
+        
+        # Fill remainder of A with Tallest from 'others' to create a wall
+        # Sort by Height, then Weight
         others.sort(key=lambda x: (x.h, x.weight), reverse=True)
         remaining_others = []
         for item in others:
@@ -413,11 +442,18 @@ def solve_packing(container_l, container_w, container_h, items_data,
             else:
                 remaining_others.append(item)
         
+        # 3. Fill Part B (Middle) - The "Long Ones" and Heavy Pallets
+        # Put the "can_go_b" (Mid-Long) items here explicitly
         part_b.extend(can_go_b)
+        
+        # Fill remainder of B with Heavy/Dense items from remaining_others
+        # IMPORTANT: We sort remaining_others by TYPE_ID first to keep identical items together
+        # This fixes the issue of pallets being scattered and not stacking.
         remaining_others.sort(key=lambda x: (x.type_id, x.weight, x.h), reverse=True)
+        
         remaining_for_c = []
         current_b_weight = sum(i.weight for i in part_b)
-        target_b_fill = total_batch_weight * 0.60 
+        target_b_fill = total_batch_weight * 0.60 # Approximate middle target
         
         for item in remaining_others:
             if current_b_weight < target_b_fill:
@@ -426,10 +462,15 @@ def solve_packing(container_l, container_w, container_h, items_data,
             else:
                 remaining_for_c.append(item)
                 
+        # 4. Part C (Front) gets the rest
         part_c.extend(remaining_for_c)
+                
+    # --- STRATEGY: 20ft (2-PART SPLIT) ---
     else:
+        # Target Part A (Back) ~42% to allow Part B bleed-over
         target_a = 0.42 * total_batch_weight
         pool = sorted(base_items_raw, key=lambda x: (x.h, x.weight), reverse=True)
+        
         current_a_weight = 0.0
         for item in pool:
             if current_a_weight < target_a:
@@ -438,9 +479,11 @@ def solve_packing(container_l, container_w, container_h, items_data,
             else:
                 part_b.append(item)
 
+        # 20ft Rebalancing Loop
         max_iterations = 2000 
         min_a_ratio = 40.0
         max_a_ratio = 45.0
+        
         for _ in range(max_iterations):
             wt_a = sum(i.weight for i in part_a)
             ratio_a = (wt_a / total_batch_weight * 100) if total_batch_weight > 0 else 0
@@ -460,39 +503,72 @@ def solve_packing(container_l, container_w, container_h, items_data,
                 part_b.remove(item_to_move)
                 part_a.append(item_to_move)
 
-    # 3. Final Sort
+    # 3. Final Sort Internally - FIXED SORTING PRIORITY FOR LONG ITEMS
     def sort_key_smart_vertical(x):
+        # PRIORITY 1: Super Long items (>6000mm) must go FIRST. 
+        # Check MAX dimension because user might input Long dimension as Width.
         max_dim = max(x.l, x.w)
         is_super_long = 2 if max_dim >= 6000 else (1 if max_dim >= 3000 else 0)
+        
+        # PRIORITY 2: User Priority override
+        # Use negative priority because sort is Reverse=True.
+        # Priority 1 (Inside) becomes -1. Priority 5 (Door) becomes -5.
+        # -1 > -5, so Priority 1 comes first.
         user_priority = -x.priority
+
+        # PRIORITY 3: Height (Standard logic)
         h_bin = int(x.h / 100) 
+        
+        # PRIORITY 4: Weight (Heavier first = Stability)
+        
         return (is_super_long, user_priority, h_bin, x.weight, x.h)
 
     part_a.sort(key=sort_key_smart_vertical, reverse=True)
     part_b.sort(key=sort_key_smart_vertical, reverse=True)
-    if is_40ft: part_c.sort(key=sort_key_smart_vertical, reverse=True)
+    if is_40ft:
+        part_c.sort(key=sort_key_smart_vertical, reverse=True)
     
-    final_load_order = part_a + part_b + part_c if is_40ft else part_a + part_b
+    # 4. Concatenate Final Order
+    if is_40ft:
+        final_load_order = part_a + part_b + part_c
+    else:
+        final_load_order = part_a + part_b
 
-    # 4. Helper Function
+    # --- HELPER FUNCTION FOR SIMULATION ---
     def pack_into_container(container, items_pool, strategy):
+        # We perform the loop on the provided container and items_pool list
+        # items_pool is modified in place (popped)
+        
         if strategy == "Spot_Centric_Fit":
              while len(items_pool) > 0:
                 global_best_move = None
                 global_best_metric = (float('inf'),) * 12 
+                
                 for idx, item in enumerate(items_pool):
                     if container.current_weight + item.weight > container.max_weight: continue
-                    if item.l > container.W: rotations = [0]
-                    elif item.packaging_type == 1: rotations = [1, 0]
-                    else: rotations = [0, 1]
+                    
+                    # ROTATION LOGIC UPDATE:
+                    # Blue items (Type 1) = Prefer Horizontal (Rotation 1), but allow Vertical (0)
+                    # This fallback ensures they fit even if Horizontal is too wide.
+                    # If item Length > Container Width, force Vertical (Rotation 0)
+                    
+                    if item.l > container.W:
+                         rotations = [0]
+                    elif item.packaging_type == 1:
+                         # Prefer Horizontal (1) then Vertical (0)
+                         rotations = [1, 0]
+                    else:
+                         # Default for others
+                         rotations = [0, 1]
                     
                     for rot in rotations:
                         item.rotation = rot
                         anchors = container.get_all_valid_anchors(item, scoring_strategy='balanced')
                         if anchors:
                             best_a = anchors[0]
-                            if best_a[0] < global_best_metric:
-                                global_best_metric = best_a[0]
+                            current_metric = best_a[0]
+                            if current_metric < global_best_metric:
+                                global_best_metric = current_metric
                                 global_best_move = (idx, rot, best_a[1], best_a[3])
                 
                 if global_best_move:
@@ -516,11 +592,18 @@ def solve_packing(container_l, container_w, container_h, items_data,
                 found_fit = False
                 for idx, item in enumerate(items_pool):
                     if container.current_weight + item.weight > container.max_weight: continue
-                    if item.l > container.W: rotations = [0]
-                    elif item.packaging_type == 1: rotations = [1, 0]
-                    else: rotations = [0, 1]
+                    
+                    # ROTATION LOGIC UPDATE (Same as above)
+                    if item.l > container.W:
+                         rotations = [0]
+                    elif item.packaging_type == 1:
+                         rotations = [1, 0]
+                    else:
+                         rotations = [0, 1]
 
-                    best_anchor, best_rot = None, 0
+                    best_anchor = None
+                    best_rot = 0
+                    
                     for rot in rotations:
                         item.rotation = rot
                         anchors = container.get_all_valid_anchors(item, scoring_strategy='density')
@@ -548,39 +631,53 @@ def solve_packing(container_l, container_w, container_h, items_data,
     # 5. PACKING EXECUTION
     best_container = None
     best_score = float('inf')
+    
     packing_strategies = ["Spot_Centric_Fit", "Density_First_Fit"]
     
     for strat in packing_strategies:
+        # 1. Initialize Container
+        # User Request: "scan what item is left out then the item can be stack up"
+        # Strategy Update:
+        # For 40ft: Start with Floor Loading (Stacking Disabled) to spread weight/volume, then fill gaps.
+        # For 20ft: Start with Stacking ENABLED immediately because floor space is the limiting factor.
+        
         initial_stacking = True if not is_40ft else False
-        container = Container(container_l, container_w, container_h, max_weight=max_weight_kg, allow_stacking=initial_stacking, min_gap=min_gap)
+        
+        container = Container(container_l, container_w, container_h, 
+                            max_weight=max_weight_kg, 
+                            allow_stacking=initial_stacking, 
+                            min_gap=min_gap)
+        
         current_pool = copy.deepcopy(final_load_order)
+        
+        # 2. First Pass Packing
         pack_into_container(container, current_pool, strat)
         
+        # 3. Rescue Pass (Safety Net for Leftovers)
         if len(container.unpacked_items) > 0:
+            # Enable stacking to fit the rest (redundant if initial is True, but good for safety)
             container.allow_stacking = True
+            
+            # Retrieve leftovers
             leftovers = container.unpacked_items
-            container.unpacked_items = [] 
+            container.unpacked_items = [] # Clear unpacked list
+            
+            # Sort leftovers (Heavier/Bigger first for better stacking)
             leftovers.sort(key=lambda x: (x.weight, x.base_area), reverse=True)
+            
+            # Try packing again
             pack_into_container(container, leftovers, strat)
 
-        score = len(container.unpacked_items) * 10000
+        # Scoring
+        unpacked_count = len(container.unpacked_items)
         ratio_nose, _ = calculate_balance_ratios(container)
+        
+        score = unpacked_count * 10000
         score += abs(ratio_nose - 50) * 10
             
         if score < best_score:
             best_score = score
             best_container = container
-            
-    # SET INITIAL SLIDER COORDINATES FOR UNPACKED ITEMS
-    if best_container:
-        mid_L = best_container.L / 2
-        mid_W = best_container.W / 2
-        mid_H = best_container.H / 2
-        for item in best_container.unpacked_items:
-            l, w, h = item.get_dimension()
-            item.x = mid_L - (l / 2)
-            item.y = mid_W - (w / 2)
-            item.z = mid_H - (h / 2)
             
     return best_container
 
@@ -652,10 +749,42 @@ def visualize_container(container, highlight_name=None):
     for lx, ly, lz in cage_lines:
         fig.add_trace(go.Scatter3d(x=lx, y=ly, z=lz, mode='lines', line=dict(color='white', width=4), showlegend=False, hoverinfo='skip'))
 
-    # 2. Add Packed Items
+    # 2. Add Packed Items (With Collision Detection for Manual Adjustments)
     for i, item in enumerate(container.items):
         x, y, z = item.x, item.y, item.z
         l, w, h = item.get_dimension()
+        
+        # --- NEW: COLLISION / OUT-OF-BOUNDS CHECK ---
+        is_overlapping = False
+        
+        # Check 1: Out of Container Bounds
+        if (x < -EPSILON or y < -EPSILON or z < -EPSILON or 
+            x + l > L + EPSILON or y + w > W + EPSILON or z + h > H + EPSILON):
+            is_overlapping = True
+            
+        # Check 2: Colliding with other Packed Items
+        if not is_overlapping:
+            for j, other in enumerate(container.items):
+                if i == j: continue # Don't check against itself
+                o_x, o_y, o_z = other.x, other.y, other.z
+                o_l, o_w, o_h = other.get_dimension()
+                
+                # Standard AABB overlap check
+                if (x < o_x + o_l - EPSILON and x + l > o_x + EPSILON and
+                    y < o_y + o_w - EPSILON and y + w > o_y + EPSILON and
+                    z < o_z + o_h - EPSILON and z + h > o_z + EPSILON):
+                    is_overlapping = True
+                    break
+        
+        # Decide Render Properties based on overlap status
+        render_color = item.color
+        edge_color = 'black'
+        hover_status = "✅ Inside"
+        
+        if is_overlapping:
+            render_color = 'rgba(239, 68, 68, 0.8)' # Bright Red for Overlap
+            edge_color = 'red'
+            hover_status = "❌ COLLISION DETECTED"
         
         vx = [x, x+l, x+l, x, x, x+l, x+l, x]
         vy = [y, y, y+w, y+w, y, y, y+w, y+w]
@@ -667,7 +796,7 @@ def visualize_container(container, highlight_name=None):
         
         type_str = "Pallet" if item.packaging_type == 1 else "Crate"
         
-        # Dim non-highlighted packed items slightly if a highlight is active
+        # Dim non-highlighted items slightly if a highlight is active
         opacity = 1.0
         if highlight_name and highlight_name != item.name:
             opacity = 0.2
@@ -675,12 +804,12 @@ def visualize_container(container, highlight_name=None):
         fig.add_trace(go.Mesh3d(
             x=vx, y=vy, z=vz,
             i=i_idx, j=j_idx, k=k_idx,
-            color=item.color,
+            color=render_color,
             opacity=opacity,
             flatshading=True,
             name=item.name,
             customdata=[f"P_{i}"] * len(vx),
-            text=f"Priority: {item.priority}<br>{item.name}<br>Type: {type_str}<br>Pos: {x:.0f},{y:.0f},{z:.0f}"
+            text=f"{hover_status}<br>Priority: {item.priority}<br>{item.name}<br>Type: {type_str}<br>Pos: {x:.0f},{y:.0f},{z:.0f}"
         ))
         
         edges = [
@@ -692,12 +821,14 @@ def visualize_container(container, highlight_name=None):
             ([x, x], [y+w, y+w], [z, z+h]), ([x+l, x+l], [y+w, y+w], [z, z+h])
         ]
         for ex, ey, ez in edges:
-            fig.add_trace(go.Scatter3d(x=ex, y=ey, z=ez, mode='lines', line=dict(color='black', width=2), showlegend=False, hoverinfo='skip'))
+            fig.add_trace(go.Scatter3d(x=ex, y=ey, z=ez, mode='lines', line=dict(color=edge_color, width=2), showlegend=False, hoverinfo='skip'))
 
-    # 3. Add Unpacked Items (Ghost items now dynamically follow their x,y,z)
+    # 3. Add Unpacked Items (Ghost items now dynamically follow their x,y,z and appear red)
     for i, item in enumerate(container.unpacked_items):
         l, w, h = item.get_dimension()
-        x, y, z = item.x, item.y, item.z
+        x = getattr(item, 'x', 0)
+        y = getattr(item, 'y', 0)
+        z = getattr(item, 'z', 0)
         
         vx = [x, x+l, x+l, x, x, x+l, x+l, x]
         vy = [y, y, y+w, y+w, y, y, y+w, y+w]
@@ -707,7 +838,7 @@ def visualize_container(container, highlight_name=None):
         j_idx = [1, 2, 5, 6, 1, 5, 2, 6, 3, 7, 0, 4]
         k_idx = [2, 3, 6, 7, 5, 4, 6, 5, 7, 6, 4, 7]
         
-        # Ghostly Red effect
+        # Ghostly Red effect for overlapped/unpacked items
         opacity = 0.8 if highlight_name == item.name else 0.4
             
         fig.add_trace(go.Mesh3d(
@@ -718,7 +849,7 @@ def visualize_container(container, highlight_name=None):
             flatshading=True,
             name=f"UNPACKED_{i}",
             customdata=[f"U_{i}"] * len(vx),
-            text=f"⚠️ UNPACKED<br>{item.name}<br>Dim: {l:.0f}x{w:.0f}x{h:.0f}"
+            text=f"⚠️ UNPACKED/OVERLAP<br>{item.name}<br>Dim: {l:.0f}x{w:.0f}x{h:.0f}"
         ))
         
         edges = [
@@ -737,7 +868,7 @@ def visualize_container(container, highlight_name=None):
     cog_x, cog_y, cog_z = stats['cog_x'], stats['cog_y'], stats['cog_z']
     fig.add_trace(go.Scatter3d(
         x=[cog_x], y=[cog_y], z=[cog_z],
-        mode='markers', marker=dict(size=12, color='blue', symbol='circle'),
+        mode='markers', marker=dict(size=12, color='red', symbol='circle'),
         name='Center of Gravity'
     ))
 
